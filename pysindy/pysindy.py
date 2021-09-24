@@ -2,11 +2,14 @@ import warnings
 from typing import Sequence
 
 from numpy import concatenate
+from numpy import insert
 from numpy import isscalar
 from numpy import ndim
 from numpy import newaxis
+from numpy import sort
 from numpy import vstack
 from numpy import zeros
+from numpy.random import choice
 from scipy.integrate import odeint
 from scipy.interpolate import interp1d
 from scipy.linalg import LinAlgWarning
@@ -17,10 +20,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_is_fitted
 
 from .differentiation import FiniteDifference
+from .feature_library import PDELibrary
 from .feature_library import PolynomialLibrary
 from .optimizers import SINDyOptimizer
 from .optimizers import STLSQ
 from .utils import drop_nan_rows
+from .utils import drop_random_rows
 from .utils import equations
 from .utils import validate_control_variables
 from .utils import validate_input
@@ -175,6 +180,12 @@ class SINDy(BaseEstimator):
         multiple_trajectories=False,
         unbias=True,
         quiet=False,
+        ensemble=False,
+        library_ensemble=False,
+        replace=True,
+        n_candidates_to_drop=1,
+        n_subset=None,
+        n_models=None,
     ):
         """
         Fit a SINDy model.
@@ -234,6 +245,27 @@ class SINDy(BaseEstimator):
         quiet: boolean, optional (default False)
             Whether or not to suppress warnings during model fitting.
 
+        ensemble : boolean, optional (default False)
+            Whether or not to use ensemble methods to generate n_models models
+            by subsampling n_subset time points.
+
+        library_ensemble : boolean, optional (default False)
+            Whether or not to use ensemble methods to generate n_models models
+            by subsampling library terms.
+
+        replace : boolean, optional (default True)
+            If ensemble true, whether or not to time sample with replacement.
+
+        n_candidates_to_drop : int, optional (default 1)
+            Number of candidate terms in the feature library to drop during
+            library ensembling.
+
+        n_subset : int, optional (default len(time base))
+            Number of time points to use for ensemble
+
+        n_models : int, optional (default 20)
+            Number of models to generate via ensemble
+
         Returns
         -------
         self: a fitted :class:`SINDy` instance
@@ -252,6 +284,14 @@ class SINDy(BaseEstimator):
             )
             self.n_control_features_ = u.shape[1]
 
+        if (ensemble or library_ensemble) and n_models is None:
+            n_models = 20
+        if ensemble and n_subset is None:
+            n_subset = x.shape[0]
+        if (n_models is not None) and n_models <= 0:
+            raise ValueError("n_models must be a positive integer")
+        if (n_subset is not None) and n_subset <= 0:
+            raise ValueError("n_subset must be a positive integer")
         if multiple_trajectories:
             x, x_dot = self._process_multiple_trajectories(x, t, x_dot)
         else:
@@ -273,8 +313,9 @@ class SINDy(BaseEstimator):
         if self.n_control_features_ > 0:
             x = concatenate((x, u), axis=1)
 
-        # Drop rows where derivative isn't known
-        x, x_dot = drop_nan_rows(x, x_dot)
+        # Drop rows where derivative isn't known unless using weak PDE form
+        if not hasattr(self.feature_library, "weak_form"):
+            x, x_dot = drop_nan_rows(x, x_dot)
 
         if hasattr(self.optimizer, "unbias"):
             unbias = self.optimizer.unbias
@@ -289,7 +330,58 @@ class SINDy(BaseEstimator):
             warnings.filterwarnings(action, category=LinAlgWarning)
             warnings.filterwarnings(action, category=UserWarning)
 
-            self.model.fit(x, x_dot)
+            if ensemble and not library_ensemble:
+                self.coef_list = []
+                for i in range(n_models):
+                    x_ensemble, x_dot_ensemble = drop_random_rows(
+                        x, x_dot, n_subset, replace, self.feature_library, PDELibrary
+                    )
+                    self.model.fit(x_ensemble, x_dot_ensemble)
+                    self.coef_list.append(self.model.steps[-1][1].coef_)
+            elif library_ensemble and not ensemble:
+                self.feature_library.library_ensemble = True
+                (self.feature_library).fit(x)
+                N = self.feature_library.n_output_features_
+                self.coef_list = []
+                for i in range(n_models):
+                    self.feature_library.ensemble_indices = sort(
+                        choice(range(N), n_candidates_to_drop, replace=False)
+                    )
+                    self.model.fit(x, x_dot)
+                    coef_partial = self.model.steps[-1][1].coef_
+                    for j in range(n_candidates_to_drop):
+                        coef_partial = insert(
+                            coef_partial,
+                            self.feature_library.ensemble_indices[j],
+                            0,
+                            axis=-1,
+                        )
+                    self.coef_list.append(coef_partial)
+            elif ensemble and library_ensemble:
+                self.feature_library.library_ensemble = True
+                (self.feature_library).fit(x)
+                N = self.feature_library.n_output_features_
+                self.coef_list = []
+                for i in range(n_models):
+                    x_ensemble, x_dot_ensemble = drop_random_rows(
+                        x, x_dot, n_subset, replace, self.feature_library, PDELibrary
+                    )
+                    for j in range(n_models):
+                        self.feature_library.ensemble_indices = sort(
+                            choice(range(N), n_candidates_to_drop, replace=False)
+                        )
+                        self.model.fit(x_ensemble, x_dot_ensemble)
+                        coef_partial = self.model.steps[-1][1].coef_
+                        for k in range(n_candidates_to_drop):
+                            coef_partial = insert(
+                                coef_partial,
+                                self.feature_library.ensemble_indices[k],
+                                0,
+                                axis=-1,
+                            )
+                        self.coef_list.append(coef_partial)
+            else:
+                self.model.fit(x, x_dot)
 
         self.n_input_features_ = self.model.steps[0][1].n_input_features_
         self.n_output_features_ = self.model.steps[0][1].n_output_features_
